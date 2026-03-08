@@ -10,9 +10,22 @@ import gzip
 import math
 import numpy as np
 import multiprocessing as mp
+import ecole
 
 import pyscipopt as scip
+from pyscipopt import SCIP_RESULT
 import utilities
+
+def _maybe_start_strongbranch(model):
+    if hasattr(model, "startStrongbranch"):
+        model.startStrongbranch()
+
+def _maybe_end_strongbranch(model):
+    if hasattr(model, "endStrongbranch"):
+        model.endStrongbranch()
+        
+def _strongbranch_available(model):
+    return hasattr(model, "getVarStrongbranch")
 
 class VanillaFullstrongBranchingDataCollector(scip.Branchrule):
     """
@@ -28,6 +41,8 @@ class VanillaFullstrongBranchingDataCollector(scip.Branchrule):
         self.rng = rng
         self.iteration_counter = 0
         
+        #self.pyscip_model = pyscip_model
+        
 
     def branchinit(self):
         self.ndomchgs = 0
@@ -36,36 +51,91 @@ class VanillaFullstrongBranchingDataCollector(scip.Branchrule):
 
     def branchexeclp(self, allowaddcons):
         self.iteration_counter += 1
-
+    
         query_expert = self.rng.rand() < self.query_expert_prob
-        if query_expert or self.model.getNNodes() == 1:
-            candidate_vars, *_ = self.model.getPseudoBranchCands()
-            candidate_mask = [var.getCol().getLPPos() for var in candidate_vars]
-
-            state = utilities.extract_state(self.model)
-            state_khalil = utilities.extract_khalil_variable_features(self.model, candidate_vars, self.khalil_root_buffer)
-
-            result = self.model.executeBranchRule('vanillafullstrong', allowaddcons)
-            cands_, scores, npriocands, bestcand = self.model.getVanillafullstrongData()
-            best_var = cands_[bestcand]
-
-            self.add_obs(best_var, (state, state_khalil), (cands_, scores))
-            if self.model.getNNodes() == 1:
-                self.state = [state, state_khalil, self.obss[0]]
-
-            self.model.branchVar(best_var)
-            result = scip.SCIP_RESULT.BRANCHED
-        else:
-            result = self.model.executeBranchRule(self.exploration_policy, allowaddcons)
-
-        # fair node counting
-        if result == scip.SCIP_RESULT.REDUCEDDOM:
-            self.ndomchgs += 1
-        elif result == scip.SCIP_RESULT.CUTOFF:
-            self.ncutoffs += 1
-
-        return {'result':result}
-
+        if not (query_expert or self.model.getNNodes() == 1):
+            return {"result": scip.SCIP_RESULT.DIDNOTRUN}
+    
+        branch_cands, branch_cand_sols, branch_cand_fracs, ncands, npriocands, nimplcands = self.model.getLPBranchCands()
+    
+        if npriocands == 0:
+            return {"result": scip.SCIP_RESULT.DIDNOTRUN}
+    
+        candidate_vars = list(branch_cands[:npriocands])
+    
+        state = utilities.extract_state(self.model)
+        state_khalil = utilities.extract_khalil_variable_features(
+            self.model, candidate_vars, self.khalil_root_buffer
+        )
+    
+        scores = np.full(npriocands, -np.inf, dtype=np.float32)
+        best_cand_idx = 0
+        num_nodes = self.model.getNNodes()
+        lpobjval = self.model.getLPObjVal()
+        lperror = False
+    
+        if hasattr(self.model, "startStrongbranch"):
+            self.model.startStrongbranch()
+    
+        for i in range(npriocands):
+            var = candidate_vars[i]
+    
+            try:
+                if hasattr(self.model, "getVarStrongbranchNode") and hasattr(self.model, "getVarStrongbranchLast"):
+                    if self.model.getVarStrongbranchNode(var) == num_nodes:
+                        down, up, downvalid, upvalid, _, lastlpobjval = self.model.getVarStrongbranchLast(var)
+                        downgain = max(down - lastlpobjval, 0) if downvalid else 0.0
+                        upgain = max(up - lastlpobjval, 0) if upvalid else 0.0
+                        score = self.model.getBranchScoreMultiple(var, [downgain, upgain])
+                        scores[i] = score
+                        if score > scores[best_cand_idx]:
+                            best_cand_idx = i
+                        continue
+            except Exception:
+                pass
+    
+            down, up, downvalid, upvalid, downinf, upinf, downconflict, upconflict, lperror = \
+                self.model.getVarStrongbranch(var, 200, idempotent=False)
+    
+            if lperror:
+                break
+    
+            if downinf and upinf:
+                if hasattr(self.model, "endStrongbranch"):
+                    self.model.endStrongbranch()
+                self.ncutoffs += 1
+                return {"result": scip.SCIP_RESULT.CUTOFF}
+    
+            downgain = max(down - lpobjval, 0.0) if ((not downinf) and downvalid) else 0.0
+            upgain = max(up - lpobjval, 0.0) if ((not upinf) and upvalid) else 0.0
+    
+            try:
+                score = self.model.getBranchScoreMultiple(var, [downgain, upgain])
+            except Exception:
+                score = downgain + upgain
+    
+            scores[i] = score
+    
+            if score > scores[best_cand_idx]:
+                best_cand_idx = i
+    
+        if hasattr(self.model, "endStrongbranch"):
+            self.model.endStrongbranch()
+    
+        if lperror:
+            return {"result": scip.SCIP_RESULT.DIDNOTRUN}
+    
+        best_var = candidate_vars[best_cand_idx]
+    
+        self.add_obs(best_var, (state, state_khalil), (candidate_vars, scores.tolist()))
+    
+        if self.model.getNNodes() == 1 and len(self.obss) > 0:
+            self.state = [state, state_khalil, self.obss[0]]
+    
+        self.model.branchVarVal(best_var, branch_cand_sols[best_cand_idx])
+    
+        return {"result": scip.SCIP_RESULT.BRANCHED}
+        
     def add_obs(self, best_var, state_, cands_scores=None):
         """
         Adds sample to the `self.obs` to be processed later at the end of optimization.
@@ -87,7 +157,9 @@ class VanillaFullstrongBranchingDataCollector(scip.Branchrule):
             self.obss = []
             self.targets = []
             self.obss_feats = []
-            self.map = sorted([x.getCol().getIndex() for x in self.model.getVars(transformed=True)])
+            vars_now = list(self.model.getVars(transformed=True))
+            self.map = [x.name for x in vars_now]
+            self.varpos = {name: i for i, name in enumerate(self.map)}
 
         cands, scores = cands_scores
         # Do not record inconsistent scores. May happen if SCIP was early stopped (time limit).
@@ -100,18 +172,23 @@ class VanillaFullstrongBranchingDataCollector(scip.Branchrule):
         edge_features = state[1]
 
         # add more features to variables
-        cands_index = [x.getCol().getIndex() for x in cands]
-        khalil_features = -np.ones((var_features.shape[0], state_khalil.shape[1]))
-        cand_ind = np.zeros((var_features.shape[0],1))
-        khalil_features[cands_index] = state_khalil
+        cands_index = [self.varpos[x.name] for x in cands if x.name in self.varpos]
+        cand_ind = np.zeros((var_features.shape[0], 1), dtype=var_features.dtype)
+        #print("DEBUG add_obs:", var_features.shape, len(cands_index), max(cands_index) if len(cands_index) else None)
         cand_ind[cands_index] = 1
-        var_features = np.concatenate([var_features, khalil_features, cand_ind], axis=1)
+        
+        if state_khalil is not None and state_khalil.shape[1] > 0:
+            khalil_features = -np.ones((var_features.shape[0], state_khalil.shape[1]), dtype=var_features.dtype)
+            khalil_features[cands_index] = state_khalil
+            var_features = np.concatenate([var_features, khalil_features, cand_ind], axis=1)
+        else:
+            var_features = np.concatenate([var_features, cand_ind], axis=1)
 
         tmp_scores = -np.ones(len(self.map))
         if scores:
             tmp_scores[cands_index] = scores
 
-        self.targets.append(best_var.getCol().getIndex())
+        self.targets.append(self.varpos[best_var.name])
         self.obss.append([var_features, cons_features, edge_features])
         depth = self.model.getCurrentNode().getDepth()
         self.obss_feats.append({'depth':depth, 'scores':np.array(tmp_scores), 'iteration': self.iteration_counter})
@@ -146,11 +223,11 @@ def make_samples(in_queue, out_queue, node_record_prob=1):
             name="Sampling branching rule", desc="",
             priority=666666, maxdepth=-1, maxbounddist=1)
 
-        m.setBoolParam('branching/vanillafullstrong/integralcands', True)
-        m.setBoolParam('branching/vanillafullstrong/scoreall', True)
-        m.setBoolParam('branching/vanillafullstrong/collectscores', True)
-        m.setBoolParam('branching/vanillafullstrong/donotbranch', True)
-        m.setBoolParam('branching/vanillafullstrong/idempotent', True)
+        # m.setBoolParam('branching/vanillafullstrong/integralcands', True)
+        # m.setBoolParam('branching/vanillafullstrong/scoreall', True)
+        # m.setBoolParam('branching/vanillafullstrong/collectscores', True)
+        # m.setBoolParam('branching/vanillafullstrong/donotbranch', True)
+        # m.setBoolParam('branching/vanillafullstrong/idempotent', True)
 
         out_queue.put({
             "type":'start',

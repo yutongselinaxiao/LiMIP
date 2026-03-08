@@ -1,9 +1,55 @@
 import datetime
+import argparse
 import numpy as np
 import scipy.sparse as sp
 import pyscipopt as scip
 import pickle
 import gzip
+import ecole
+
+# ---------- Ecole observation functions ----------
+_NODE_BIPARTITE_OBS = ecole.observation.NodeBipartite(cache=False)
+_SB_SCORES_OBS = ecole.observation.StrongBranchingScores(pseudo_candidates=False)
+
+def _as_ecole_model(model):
+    """
+    Convert PySCIPOpt model to Ecole model sharing the same SCIP state.
+    """
+    return ecole.scip.Model.from_pyscipopt(model)
+
+def _safe_var_name(v):
+    try:
+        return v.name
+    except Exception:
+        try:
+            return v.getName()
+        except Exception:
+            return None
+
+def _var_probindex(v):
+    """
+    Best-effort variable problem index for aligning with Ecole scores.
+    """
+    for name in ["getProbindex", "getProbIndex", "getIndex"]:
+        if hasattr(v, name):
+            try:
+                idx = int(getattr(v, name)())
+                if idx >= 0:
+                    return idx
+            except Exception:
+                pass
+
+    # fallback through column lp position if needed
+    try:
+        col = v.getCol()
+        if hasattr(col, "getLPPos"):
+            idx = int(col.getLPPos())
+            if idx >= 0:
+                return idx
+    except Exception:
+        pass
+
+    return None
 
 def log(str, logfile=None):
     str = f'[{datetime.datetime.now()}] {str}'
@@ -45,176 +91,278 @@ def init_scip_params(model, seed, heuristics=True, presolving=True, separating=T
     if not heuristics:
         model.setHeuristics(scip.SCIP_PARAMSETTING.OFF)
 
-
 def extract_state(model, buffer=None):
     """
-    Compute a bipartite graph representation of the solver. In this
-    representation, the variables and constraints of the MILP are the
-    left- and right-hand side nodes, and an edge links two nodes iff the
-    variable is involved in the constraint. Both the nodes and edges carry
-    features.
-
-    Parameters
-    ----------
-    model : pyscipopt.scip.Model
-        The current model.
-    buffer : dict
-        A buffer to avoid re-extracting redundant information from the solver
-        each time.
-    Returns
-    -------
-    variable_features : dictionary of type {'names': list, 'values': np.ndarray}
-        The features associated with the variable nodes in the bipartite graph.
-    edge_features : dictionary of type ('names': list, 'indices': np.ndarray, 'values': np.ndarray}
-        The features associated with the edges in the bipartite graph.
-        This is given as a sparse matrix in COO format.
-    constraint_features : dictionary of type {'names': list, 'values': np.ndarray}
-        The features associated with the constraint nodes in the bipartite graph.
+    Manual fallback extractor for newer PySCIPOpt versions without getState().
+    Returns:
+        constraint_features, edge_features, variable_features
+    in the same outer format expected by the rest of the pipeline.
     """
-    if buffer is None or model.getNNodes() == 1:
-        buffer = {}
+    import numpy as np
 
-    # update state from buffer if any
-    s = model.getState(buffer['scip_state'] if 'scip_state' in buffer else None)
+    def _safe_name(v):
+        try:
+            return v.name
+        except Exception:
+            return v.getName()
 
-    if 'state' in buffer:
-        obj_norm = buffer['state']['obj_norm']
-    else:
-        obj_norm = np.linalg.norm(s['col']['coefs'])
-        obj_norm = 1 if obj_norm <= 0 else obj_norm
+    def _safe_obj(v):
+        try:
+            return float(v.getObj())
+        except Exception:
+            try:
+                return float(v.obj)
+            except Exception:
+                return 0.0
 
-    row_norms = s['row']['norms']
-    row_norms[row_norms == 0] = 1
+    def _safe_vtype(v):
+        try:
+            return v.vtype()
+        except Exception:
+            try:
+                return v.getType()
+            except Exception:
+                return "CONTINUOUS"
 
-    # Column features
-    n_cols = len(s['col']['types'])
+    def _safe_lb(v):
+        try:
+            return v.getLbGlobal()
+        except Exception:
+            try:
+                return v.getLbLocal()
+            except Exception:
+                return None
 
-    if 'state' in buffer:
-        col_feats = buffer['state']['col_feats']
-    else:
-        col_feats = {}
-        col_feats['type'] = np.zeros((n_cols, 4))  # BINARY INTEGER IMPLINT CONTINUOUS
-        col_feats['type'][np.arange(n_cols), s['col']['types']] = 1
-        col_feats['coef_normalized'] = s['col']['coefs'].reshape(-1, 1) / obj_norm
+    def _safe_ub(v):
+        try:
+            return v.getUbGlobal()
+        except Exception:
+            try:
+                return v.getUbLocal()
+            except Exception:
+                return None
 
-    col_feats['has_lb'] = ~np.isnan(s['col']['lbs']).reshape(-1, 1)
-    col_feats['has_ub'] = ~np.isnan(s['col']['ubs']).reshape(-1, 1)
-    col_feats['sol_is_at_lb'] = s['col']['sol_is_at_lb'].reshape(-1, 1)
-    col_feats['sol_is_at_ub'] = s['col']['sol_is_at_ub'].reshape(-1, 1)
-    col_feats['sol_frac'] = s['col']['solfracs'].reshape(-1, 1)
-    col_feats['sol_frac'][s['col']['types'] == 3] = 0  # continuous have no fractionality
-    col_feats['basis_status'] = np.zeros((n_cols, 4))  # LOWER BASIC UPPER ZERO
-    col_feats['basis_status'][np.arange(n_cols), s['col']['basestats']] = 1
-    col_feats['reduced_cost'] = s['col']['redcosts'].reshape(-1, 1) / obj_norm
-    col_feats['age'] = s['col']['ages'].reshape(-1, 1) / (s['stats']['nlps'] + 5)
-    col_feats['sol_val'] = s['col']['solvals'].reshape(-1, 1)
-    col_feats['inc_val'] = s['col']['incvals'].reshape(-1, 1)
-    col_feats['avg_inc_val'] = s['col']['avgincvals'].reshape(-1, 1)
+    def _safe_sol(model, v):
+        try:
+            return float(model.getSolVal(None, v))
+        except Exception:
+            try:
+                return float(v.getLPSol())
+            except Exception:
+                return 0.0
 
-    col_feat_names = [[k, ] if v.shape[1] == 1 else [f'{k}_{i}' for i in range(v.shape[1])] for k, v in col_feats.items()]
-    col_feat_names = [n for names in col_feat_names for n in names]
-    col_feat_vals = np.concatenate(list(col_feats.values()), axis=-1)
+    def _safe_var_name(v):
+        try:
+            return v.name
+        except Exception:
+            try:
+                return v.getName()
+            except Exception:
+                return None
+
+    def _safe_col_var_name(col):
+        try:
+            v = col.getVar()
+            return _safe_var_name(v)
+        except Exception:
+            pass
+        try:
+            return col.name
+        except Exception:
+            pass
+        try:
+            return col.getName()
+        except Exception:
+            return None
+
+    vars_ = list(model.getVars(transformed=True))
+    col_index = {_safe_name(v): i for i, v in enumerate(vars_)}
+
+    obj = np.array([_safe_obj(v) for v in vars_], dtype=np.float32)
+    obj_norm = np.linalg.norm(obj)
+    if obj_norm <= 0:
+        obj_norm = 1.0
+
+    # ---------- variable features ----------
+    v_feats = []
+    for v in vars_:
+        vt = [0.0, 0.0, 0.0, 0.0]  # BINARY, INTEGER, IMPLINT, CONTINUOUS
+        vtype = _safe_vtype(v)
+
+        if vtype == "BINARY":
+            vt[0] = 1.0
+        elif vtype == "INTEGER":
+            vt[1] = 1.0
+        elif vtype == "IMPLINT":
+            vt[2] = 1.0
+        else:
+            vt[3] = 1.0
+
+        lb = _safe_lb(v)
+        ub = _safe_ub(v)
+
+        has_lb = 0.0 if lb is None or np.isneginf(lb) else 1.0
+        has_ub = 0.0 if ub is None or np.isposinf(ub) else 1.0
+
+        sol = _safe_sol(model, v)
+        sol_at_lb = float(has_lb and abs(sol - lb) <= 1e-6)
+        sol_at_ub = float(has_ub and abs(sol - ub) <= 1e-6)
+
+        frac = 0.0
+        if vt[3] == 0.0:
+            frac = abs(sol - np.round(sol))
+
+        try:
+            redcost = float(model.getVarRedcost(v)) / obj_norm
+        except Exception:
+            redcost = 0.0
+
+        inc_val = 0.0
+        avg_inc_val = 0.0
+        age = 0.0
+        basis = [0.0, 0.0, 0.0, 0.0]
+
+        row = vt + [
+            _safe_obj(v) / obj_norm,
+            has_lb,
+            has_ub,
+            sol_at_lb,
+            sol_at_ub,
+            frac,
+            redcost,
+            sol,
+            inc_val,
+            avg_inc_val,
+        ] + basis + [age]
+
+        v_feats.append(row)
+
+    v_feats = np.asarray(v_feats, dtype=np.float32)
 
     variable_features = {
-        'names': col_feat_names,
-        'values': col_feat_vals,}
+        "names": [f"var_feat_{i}" for i in range(v_feats.shape[1])],
+        "values": v_feats,
+    }
 
-    # Row features
+    # ---------- constraint features + edge features from LP rows ----------
+    rows = model.getLPRowsData()
 
-    if 'state' in buffer:
-        row_feats = buffer['state']['row_feats']
-        has_lhs = buffer['state']['has_lhs']
-        has_rhs = buffer['state']['has_rhs']
+    c_feats = []
+    edge_rows = []
+    edge_cols = []
+    edge_vals = []
+
+    for r_idx, row in enumerate(rows):
+        try:
+            row_cols = row.getCols()
+        except Exception:
+            row_cols = []
+
+        try:
+            row_vals = row.getVals()
+        except Exception:
+            row_vals = []
+
+        coeffs = np.array(row_vals, dtype=np.float32) if len(row_vals) else np.zeros(0, dtype=np.float32)
+        row_norm = np.linalg.norm(coeffs)
+        if row_norm <= 0:
+            row_norm = 1.0
+
+        try:
+            lhs = row.getLhs()
+        except Exception:
+            lhs = np.nan
+
+        try:
+            rhs = row.getRhs()
+        except Exception:
+            rhs = np.nan
+
+        try:
+            dual = row.getDualsol() / (row_norm * obj_norm)
+        except Exception:
+            try:
+                dual = model.getDualsolLinear(row) / (row_norm * obj_norm)
+            except Exception:
+                dual = 0.0
+
+        try:
+            activity = row.getLPActivity()
+        except Exception:
+            try:
+                activity = model.getRowLPActivity(row)
+            except Exception:
+                activity = 0.0
+
+        slack = 0.0
+        try:
+            if np.isfinite(lhs) and np.isfinite(rhs) and abs(lhs - rhs) <= 1e-9:
+                slack = abs(activity - rhs)
+            elif np.isfinite(rhs):
+                slack = rhs - activity
+            elif np.isfinite(lhs):
+                slack = activity - lhs
+        except Exception:
+            slack = 0.0
+
+        try:
+            obj_par = model.getRowObjParallelism(row)
+        except Exception:
+            obj_par = 0.0
+
+        is_tight = float(abs(slack) <= 1e-6)
+
+        c_feats.append([
+            obj_par,
+            activity / row_norm,
+            slack / row_norm,
+            dual,
+            is_tight,
+        ])
+
+        for col, coef in zip(row_cols, row_vals):
+            var_name = _safe_col_var_name(col)
+            if var_name is None:
+                continue
+            if var_name not in col_index:
+                continue
+
+            edge_rows.append(r_idx)
+            edge_cols.append(col_index[var_name])
+            edge_vals.append([float(coef) / row_norm])
+
+    c_feats = np.asarray(c_feats, dtype=np.float32)
+
+    if len(edge_rows) > 0:
+        e_idx = np.vstack([
+            np.asarray(edge_rows, dtype=np.int64),
+            np.asarray(edge_cols, dtype=np.int64),
+        ])
+        e_vals = np.asarray(edge_vals, dtype=np.float32)
     else:
-        row_feats = {}
-        has_lhs = np.nonzero(~np.isnan(s['row']['lhss']))[0]
-        has_rhs = np.nonzero(~np.isnan(s['row']['rhss']))[0]
-        row_feats['obj_cosine_similarity'] = np.concatenate((
-            -s['row']['objcossims'][has_lhs],
-            +s['row']['objcossims'][has_rhs])).reshape(-1, 1)
-        row_feats['bias'] = np.concatenate((
-            -(s['row']['lhss'] / row_norms)[has_lhs],
-            +(s['row']['rhss'] / row_norms)[has_rhs])).reshape(-1, 1)
-
-    row_feats['is_tight'] = np.concatenate((
-        s['row']['is_at_lhs'][has_lhs],
-        s['row']['is_at_rhs'][has_rhs])).reshape(-1, 1)
-
-    row_feats['age'] = np.concatenate((
-        s['row']['ages'][has_lhs],
-        s['row']['ages'][has_rhs])).reshape(-1, 1) / (s['stats']['nlps'] + 5)
-
-    # # redundant with is_tight
-    # tmp = s['row']['basestats']  # LOWER BASIC UPPER ZERO
-    # tmp[s['row']['lhss'] == s['row']['rhss']] = 4  # LOWER == UPPER for equality constraints
-    # tmp_l = tmp[has_lhs]
-    # tmp_l[tmp_l == 2] = 1  # LHS UPPER -> BASIC
-    # tmp_l[tmp_l == 4] = 2  # EQU UPPER -> UPPER
-    # tmp_l[tmp_l == 0] = 2  # LHS LOWER -> UPPER
-    # tmp_r = tmp[has_rhs]
-    # tmp_r[tmp_r == 0] = 1  # RHS LOWER -> BASIC
-    # tmp_r[tmp_r == 4] = 2  # EQU LOWER -> UPPER
-    # tmp = np.concatenate((tmp_l, tmp_r)) - 1  # BASIC UPPER ZERO
-    # row_feats['basis_status'] = np.zeros((len(has_lhs) + len(has_rhs), 3))
-    # row_feats['basis_status'][np.arange(len(has_lhs) + len(has_rhs)), tmp] = 1
-
-    tmp = s['row']['dualsols'] / (row_norms * obj_norm)
-    row_feats['dualsol_val_normalized'] = np.concatenate((
-            -tmp[has_lhs],
-            +tmp[has_rhs])).reshape(-1, 1)
-
-    row_feat_names = [[k, ] if v.shape[1] == 1 else [f'{k}_{i}' for i in range(v.shape[1])] for k, v in row_feats.items()]
-    row_feat_names = [n for names in row_feat_names for n in names]
-    row_feat_vals = np.concatenate(list(row_feats.values()), axis=-1)
+        e_idx = np.zeros((2, 0), dtype=np.int64)
+        e_vals = np.zeros((0, 1), dtype=np.float32)
 
     constraint_features = {
-        'names': row_feat_names,
-        'values': row_feat_vals,}
-
-    # Edge features
-    if 'state' in buffer:
-        edge_row_idxs = buffer['state']['edge_row_idxs']
-        edge_col_idxs = buffer['state']['edge_col_idxs']
-        edge_feats = buffer['state']['edge_feats']
-    else:
-        coef_matrix = sp.csr_matrix(
-            (s['nzrcoef']['vals'] / row_norms[s['nzrcoef']['rowidxs']],
-            (s['nzrcoef']['rowidxs'], s['nzrcoef']['colidxs'])),
-            shape=(len(s['row']['nnzrs']), len(s['col']['types'])))
-        coef_matrix = sp.vstack((
-            -coef_matrix[has_lhs, :],
-            coef_matrix[has_rhs, :])).tocoo(copy=False)
-
-        edge_row_idxs, edge_col_idxs = coef_matrix.row, coef_matrix.col
-        edge_feats = {}
-
-        edge_feats['coef_normalized'] = coef_matrix.data.reshape(-1, 1)
-
-    edge_feat_names = [[k, ] if v.shape[1] == 1 else [f'{k}_{i}' for i in range(v.shape[1])] for k, v in edge_feats.items()]
-    edge_feat_names = [n for names in edge_feat_names for n in names]
-    edge_feat_indices = np.vstack([edge_row_idxs, edge_col_idxs])
-    edge_feat_vals = np.concatenate(list(edge_feats.values()), axis=-1)
+        "names": [
+            "obj_parallelism",
+            "activity_norm",
+            "slack_norm",
+            "dual_norm",
+            "is_tight",
+        ],
+        "values": c_feats,
+    }
 
     edge_features = {
-        'names': edge_feat_names,
-        'indices': edge_feat_indices,
-        'values': edge_feat_vals,}
-
-    if 'state' not in buffer:
-        buffer['state'] = {
-            'obj_norm': obj_norm,
-            'col_feats': col_feats,
-            'row_feats': row_feats,
-            'has_lhs': has_lhs,
-            'has_rhs': has_rhs,
-            'edge_row_idxs': edge_row_idxs,
-            'edge_col_idxs': edge_col_idxs,
-            'edge_feats': edge_feats,
-        }
+        "names": ["coef_normalized"],
+        "indices": e_idx,
+        "values": e_vals,
+    }
 
     return constraint_features, edge_features, variable_features
-
-
+    
+    
 def valid_seed(seed):
     """Check whether seed is a valid random seed or not."""
     seed = int(seed)
@@ -284,29 +432,10 @@ def compute_extended_variable_features(state, candidates):
 
 def extract_khalil_variable_features(model, candidates, root_buffer):
     """
-    Extract features following Khalil et al. (2016) Learning to Branch in Mixed Integer Programming.
-
-    Parameters
-    ----------
-    model : pyscipopt.scip.Model
-        The current model.
-    candidates : list of pyscipopt.scip.Variable's
-        A list of variables for which to compute the variable features.
-    root_buffer : dict
-        A buffer to avoid re-extracting redundant root node information (None to deactivate buffering).
-
-    Returns
-    -------
-    variable_features : 2D np.ndarray
-        The features associated with the candidate variables.
+    Keep zero-width fallback for now.
+    You can later switch to ecole.observation.Khalil2016 if needed.
     """
-    # update state from state_buffer if any
-    scip_state = model.getKhalilState(root_buffer, candidates)
-
-    variable_feature_names = sorted(scip_state)
-    variable_features = np.stack([scip_state[feature_name] for feature_name in variable_feature_names], axis=1)
-
-    return variable_features
+    return np.zeros((len(candidates), 0), dtype=np.float32)
 
 
 def preprocess_variable_features(features, interaction_augmentation, normalization):

@@ -3,6 +3,19 @@ import gzip
 import numpy as np
 import torch
 
+def from_plain(obj):
+    if isinstance(obj, dict):
+        if "__ndarray__" in obj:
+            return np.array(obj["__ndarray__"], dtype=obj.get("dtype", None))
+        if "__tuple__" in obj:
+            return tuple(from_plain(x) for x in obj["__tuple__"])
+        if "__set__" in obj:
+            return set(from_plain(x) for x in obj["__set__"])
+        return {from_plain(k): from_plain(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [from_plain(x) for x in obj]
+    return obj
+
 class GCNNDataset(torch.utils.data.Dataset):
     def __init__(self, sample_files, weighted=False):
         self.sample_files = sample_files
@@ -12,8 +25,15 @@ class GCNNDataset(torch.utils.data.Dataset):
         return len(self.sample_files)
 
     def __getitem__(self, index):
-        with gzip.open(self.sample_files[index], 'rb') as f:
-            sample = pickle.load(f)
+        path = self.sample_files[index]
+        try:
+            with gzip.open(path, 'rb') as f:
+                sample = pickle.load(f)
+        except OSError:
+            with open(path, 'rb') as f:
+                sample = pickle.load(f)
+        
+        sample = from_plain(sample)
 
         weight = 1.0
         if "root" in self.sample_files[index]:

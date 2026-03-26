@@ -26,6 +26,18 @@ import pickle
 
 random.seed(0)
 
+def is_valid_pickle_file(path):
+    try:
+        if not os.path.exists(path):
+            return False
+        if os.path.getsize(path) == 0:
+            return False
+        with gzip.open(path, "rb") as f:
+            _ = pickle.load(f)
+        return True
+    except (EOFError, pickle.UnpicklingError, OSError, ValueError, gzip.BadGzipFile):
+        return False
+
 
 def logits_to_memory(model, dataloader, top_k, optimizer=None):
     """
@@ -126,9 +138,15 @@ def _loss_fn(logits, labels, weights):
     return torch.sum(loss * weights)
 
 
-def _loss_KLD(logits, logits_old, weights):
-    loss = torch.nn.MSELoss(reduction='mean')(logits, logits_old)
-    return loss
+#def _loss_KLD(logits, logits_old, weights):
+#    loss = torch.nn.MSELoss(reduction='mean')(logits, logits_old)
+#    return loss
+    
+def _loss_KLD(logits, logits_old, weights, T=1.0):
+    p_old = torch.softmax(logits_old / T, dim=-1)
+    log_p = torch.log_softmax(logits / T, dim=-1)
+    loss = torch.sum(p_old * (torch.log(p_old + 1e-12) - log_p), dim=-1)
+    return torch.mean(loss) * (T * T)
 
 def reservoir_insert(reservoir_locations_array, memory_size, memory_input_logits, dict_memory_logits_kd, index_of_new_task):
     global samples_seen_for_memory
@@ -454,9 +472,11 @@ if __name__ == '__main__':
     ### HYPER PARAMETERS ###
     max_epochs = 180
     epoch_size = 312
+    #epoch_size = 100
     batch_size = 32
     pretrain_batch_size = 128
-    valid_batch_size = 128
+    #valid_batch_size = 128
+    valid_batch_size = 16
     lr = 0.001
     patience = 15
     early_stopping = 30
@@ -511,6 +531,7 @@ if __name__ == '__main__':
         'setcover_densize_0.1': '700r_800c_0.1d',
         'setcover_densize_0.05': '700r_800c_0.05d',
         'setcover_densize_0.075': '700r_800c_0.075d',
+        'mixed_0.5_0.3_0.4_0.2_0.1_0.1': 'mixed',
         
     }
     
@@ -520,7 +541,8 @@ if __name__ == '__main__':
 
     # DIRECTORY NAMING
     modeldir = f"{args.model}"
-    running_dir = f"trained_models/MODEL_{str('_'.join(problems_sequence))}/{modeldir}/{args.seed}"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    running_dir = f"trained_models/MODEL_{str('_'.join(problems_sequence))}_{timestamp}/{modeldir}/{args.seed}"
     print(" running_dir ", running_dir)
     os.makedirs(running_dir)
 
@@ -616,19 +638,42 @@ if __name__ == '__main__':
         if args.data_path:
             dir = f"{args.data_path}/{problem}/{problem_folder}"
             
+        print("dir =", dir)
+        print("cwd =", pathlib.Path.cwd())
+        train_dir = pathlib.Path(dir) / "train"
+        valid_dir = pathlib.Path(dir) / "valid"
+        print("train_dir =", train_dir)
+        print("valid_dir =", valid_dir)
+        print("train exists =", train_dir.exists())
+        print("valid exists =", valid_dir.exists())
 
-        train_files = list(pathlib.Path(f'{dir}/train').glob('sample_*.pkl'))
-        valid_files = list(pathlib.Path(f'{dir}/valid').glob('sample_*.pkl'))
+        if train_dir.exists():
+            print("first few train files =", [p.name for p in list(train_dir.iterdir())[:10]])
+            print("matched train files =", len(list(train_dir.glob('*sample_*.pkl'))))
+                    
 
-        log(f"{len(train_files)} training samples", logfile)
-        log(f"{len(valid_files)} validation samples", logfile)
-
+        train_files = [str(x) for x in pathlib.Path(f'{dir}/train').glob('*sample_*.pkl')]
+        valid_files = [str(x) for x in pathlib.Path(f'{dir}/valid').glob('*sample_*.pkl')]
+        
+        #print(f"Checking integrity of {len(train_files)} train files...")
+        #train_files = [f for f in train_files if is_valid_pickle_file(f)]
+        #print(f"Valid train files: {len(train_files)}")
+        
+        #print(f"Checking integrity of {len(valid_files)} valid files...")
+        #valid_files = [f for f in valid_files if is_valid_pickle_file(f)]
+        #print(f"Valid valid files: {len(valid_files)}")
+        
+        #log(f"{len(train_files)} valid training samples after integrity check", logfile)
+        #log(f"{len(valid_files)} valid validation samples after integrity check", logfile)
+        
         train_files = [str(x) for x in train_files]
         valid_files = [str(x) for x in valid_files]
 
         valid_data = Dataset(valid_files)
         valid_data = torch.utils.data.DataLoader(valid_data, batch_size=valid_batch_size,
                                 shuffle = False, num_workers = num_workers, collate_fn = load_batch)
+        
+        
 
         dict_task_wise_valid_data_loaders[index]  = valid_data
         dict_task_wise_valid_data_loaders[index]  = valid_data
@@ -639,9 +684,12 @@ if __name__ == '__main__':
                                 shuffle = False, num_workers = num_workers, collate_fn = load_batch)
 
 
-        epoch_train_files = rng.choice(train_files, epoch_size * batch_size, replace=True)
+        epoch_train_count = epoch_size * batch_size
+        replace_flag = len(train_files) < epoch_train_count
+        epoch_train_files = rng.choice(train_files, epoch_train_count, replace=replace_flag)
 
-        sampled_memory_files = rng.choice(train_files, sampled_task, replace=False)
+        sampled_memory_count = min(sampled_task, len(train_files))
+        sampled_memory_files = rng.choice(train_files, sampled_memory_count, replace=False)
 
 
         train_data = Dataset(epoch_train_files)
@@ -711,7 +759,8 @@ if __name__ == '__main__':
                              index)
 
 
-        sampled_reg_files = rng.choice(sampled_memory_files,args.lam_samples, replace=False)
+        sampled_reg_count = min(args.lam_samples, len(sampled_memory_files))
+        sampled_reg_files = rng.choice(sampled_memory_files, sampled_reg_count, replace=False)
         previous_data = Dataset(sampled_reg_files)
         
         previous_data_loader = torch.utils.data.DataLoader(previous_data, batch_size=batch_size,

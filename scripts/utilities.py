@@ -5,17 +5,7 @@ import scipy.sparse as sp
 import pyscipopt as scip
 import pickle
 import gzip
-import ecole
 
-# ---------- Ecole observation functions ----------
-_NODE_BIPARTITE_OBS = ecole.observation.NodeBipartite(cache=False)
-_SB_SCORES_OBS = ecole.observation.StrongBranchingScores(pseudo_candidates=False)
-
-def _as_ecole_model(model):
-    """
-    Convert PySCIPOpt model to Ecole model sharing the same SCIP state.
-    """
-    return ecole.scip.Model.from_pyscipopt(model)
 
 def _safe_var_name(v):
     try:
